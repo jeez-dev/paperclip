@@ -98,6 +98,8 @@ Core fields:
 - search (boolean, optional): run codex with --search
 - fastMode (boolean, optional): enable Codex Fast mode; supported on GPT-5.6 (sol/terra/luna), GPT-5.5, GPT-5.4 and passed through for manual model IDs
 - dangerouslyBypassApprovalsAndSandbox (boolean, optional): run with bypass flag
+- sandboxProbe (boolean, optional): probe the codex-bundled Bubblewrap binary once at run start on local Linux targets. On hosts that block unprivileged user namespaces the probe fails fast with an actionable error instead of letting every apply_patch die mid-run. Defaults to true; set false only if the probe misfires on a working host.
+- sandboxAutoFallback (boolean, optional): when the sandbox probe fails, degrade this run to --dangerously-bypass-approvals-and-sandbox with a loud stderr warning and a codex.sandbox_unusable_auto_bypass event instead of aborting. The surrounding container/workspace isolation is then the only security boundary.
 - command (string, optional): defaults to "codex"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables

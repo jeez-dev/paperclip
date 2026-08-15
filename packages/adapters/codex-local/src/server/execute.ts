@@ -30,6 +30,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
+  asBoolean,
   asNumber,
   parseObject,
   buildPaperclipEnv,
@@ -85,6 +86,7 @@ import {
   resolveCodexAuthPrecedence,
 } from "./auth-precedence.js";
 import { prepareCodexRuntimeConfig } from "./runtime-config.js";
+import { probeCodexLinuxSandboxCapability } from "./sandbox-probe.js";
 import { resolveCodexDesiredSkillNames } from "./skills.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
@@ -132,29 +134,6 @@ function firstNonEmptyLine(text: string): string {
       .map((line) => line.trim())
       .find(Boolean) ?? ""
   );
-}
-
-// Benign stderr lines that never explain a nonzero exit and must not be
-// surfaced as the run error: Codex always prints the YOLO approvals warning
-// because this adapter passes the approvals-bypass flag itself, and
-// "[paperclip] ..." lines are diagnostics the adapter injected (e.g. ACP
-// fallback notes). Keep this list conservative so real errors are never
-// skipped.
-const BENIGN_CODEX_STDERR_LINE_RES: readonly RegExp[] = [
-  /^YOLO mode is enabled\b/i,
-  /^\[paperclip\]/,
-];
-
-function isBenignCodexStderrLine(line: string): boolean {
-  return BENIGN_CODEX_STDERR_LINE_RES.some((re) => re.test(line));
-}
-
-export function firstMeaningfulStderrLine(text: string): string {
-  const meaningful = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line && !isBenignCodexStderrLine(line));
-  return meaningful ?? firstNonEmptyLine(text);
 }
 
 function signalCodexChild(
@@ -1017,6 +996,74 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
     const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
+    // codex routes tool writes (apply_patch) through its bundled bubblewrap,
+    // which requires unprivileged user namespaces. Hosts that block them let a
+    // run start and read fine but kill every write mid-task with
+    // `bwrap: No permissions to create a new namespace`. Probe once at startup
+    // so the failure is a fast, actionable abort instead of a burned session.
+    // Operators that deliberately run without the codex sandbox
+    // (dangerouslyBypassApprovalsAndSandbox) skip the probe; sandboxAutoFallback
+    // downgrades a failed probe into that same bypass with a loud warning
+    // (the surrounding container/workspace isolation is then the only boundary).
+    const sandboxBypassConfigured = asBoolean(
+      config.dangerouslyBypassApprovalsAndSandbox,
+      asBoolean(config.dangerouslyBypassSandbox, false),
+    );
+    let sandboxAutoBypassApplied = false;
+    if (
+      !executionTargetIsRemote &&
+      process.platform === "linux" &&
+      !sandboxBypassConfigured &&
+      asBoolean(config.sandboxProbe, true)
+    ) {
+      const sandboxProbeResult = await probeCodexLinuxSandboxCapability({
+        resolvedCommand,
+        cwd,
+        env: runtimeEnv,
+      });
+      if (sandboxProbeResult.status === "usable") {
+        await onLog(
+          "stdout",
+          `[paperclip] Codex sandbox probe passed (${sandboxProbeResult.probe} at ${sandboxProbeResult.probePath}).\n`,
+        );
+      } else if (sandboxProbeResult.status === "inconclusive") {
+        await onLog(
+          "stdout",
+          `[paperclip] Codex sandbox probe inconclusive: ${sandboxProbeResult.reason ?? "unknown"}; continuing unprobed.\n`,
+        );
+      } else if (asBoolean(config.sandboxAutoFallback, false)) {
+        sandboxAutoBypassApplied = true;
+        const message =
+          `Codex Linux sandbox probe failed (${sandboxProbeResult.probe} at ${sandboxProbeResult.probePath}: ` +
+          `${sandboxProbeResult.reason ?? "unknown failure"}); adapterConfig.sandboxAutoFallback=true, so this run ` +
+          `will use --dangerously-bypass-approvals-and-sandbox with no codex-internal sandbox.`;
+        await onLog("stderr", `[paperclip] ${message}\n`);
+        await onEvent?.({
+          eventType: "codex.sandbox_unusable_auto_bypass",
+          stream: "system",
+          level: "warn",
+          message,
+          payload: {
+            probe: sandboxProbeResult.probe,
+            probePath: sandboxProbeResult.probePath,
+            reason: sandboxProbeResult.reason,
+          },
+        });
+      } else {
+        throw new Error(
+          `Codex Linux sandbox is unusable on this host (${sandboxProbeResult.probe} probe at ${sandboxProbeResult.probePath} failed: ${sandboxProbeResult.reason ?? "unknown failure"}). ` +
+            `Every apply_patch would die mid-run with "bwrap: No permissions to create a new namespace". ` +
+            `Enable unprivileged user namespaces on the host (Debian-family: sysctl kernel.unprivileged_userns_clone=1; ` +
+            `containers also need a seccomp profile permitting CLONE_NEWUSER), ` +
+            `or set adapterConfig.dangerouslyBypassApprovalsAndSandbox=true on this agent, ` +
+            `or set adapterConfig.sandboxAutoFallback=true to degrade automatically with a warning. ` +
+            `Set adapterConfig.sandboxProbe=false only if this probe misfires.`,
+        );
+      }
+    }
+    const configForRun = sandboxAutoBypassApplied
+      ? { ...config, dangerouslyBypassApprovalsAndSandbox: true }
+      : config;
     const loggedEnv = buildInvocationEnvForLogs(env, {
       runtimeEnv,
       includeRuntimeKeys: ["HOME"],
@@ -1190,7 +1237,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const runAttempt = async (resumeSessionId: string | null) => {
       const execArgs = buildCodexExecArgs(
-        forceSaferInvocation ? { ...config, fastMode: false } : config,
+        forceSaferInvocation ? { ...configForRun, fastMode: false } : configForRun,
         {
           resumeSessionId,
           skipGitRepoCheck: executionTargetIsSandbox,
@@ -1414,7 +1461,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         } as Record<string, unknown>)
         : null;
       const parsedError = typeof attempt.parsed.errorMessage === "string" ? attempt.parsed.errorMessage.trim() : "";
-      const stderrLine = firstMeaningfulStderrLine(attempt.proc.stderr);
+      const stderrLine = firstNonEmptyLine(attempt.proc.stderr);
       const fallbackErrorMessage =
         parsedError ||
         stderrLine ||
