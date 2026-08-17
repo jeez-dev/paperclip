@@ -46,6 +46,7 @@ import {
   stageCodexHomeForSync,
 } from "./codex-home.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
+import { probeCodexAcpSessionWritePath } from "./session-write-path-probe.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const packageRootDir = path.resolve(moduleDir, "../..");
@@ -296,6 +297,7 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
   return {
     resolveBillingIdentity: resolveCodexAcpBillingIdentity,
     prepareRemoteManagedHome: prepareCodexRemoteManagedHome,
+    probeSessionWritePath: probeCodexAcpSessionWritePath,
     ...options,
     adapterType: "codex_local",
     moduleDir,
