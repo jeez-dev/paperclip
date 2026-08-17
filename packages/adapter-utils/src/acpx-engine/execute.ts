@@ -308,6 +308,21 @@ export interface AcpxRemoteManagedHomeResult {
   disposeStaged?: () => Promise<void>;
 }
 
+/**
+ * Input handed to the optional per-adapter session write-path probe. Runs once
+ * per adapter execution right after the ACP session is established (fresh or
+ * warm-resume) and before session config/prompt/turn. `cwd`/`env` are the exact
+ * session cwd/env the agent will write through; `executionTarget` is the
+ * resolved execution target (null/local → probe writes via host fs; remote →
+ * probe should write through `runAdapterExecutionTargetShellCommand`).
+ */
+export interface AcpxSessionWritePathProbeInput {
+  ctx: AdapterExecutionContext;
+  cwd: string;
+  env: Record<string, string>;
+  executionTarget: AdapterExecutionTarget | null;
+}
+
 export interface AcpxEngineExecutorOptions {
   createRuntime?: AcpxRuntimeFactory;
   now?: () => number;
@@ -347,6 +362,16 @@ export interface AcpxEngineExecutorOptions {
   prepareRemoteManagedHome?: (
     input: AcpxRemoteManagedHomeContext,
   ) => Promise<AcpxRemoteManagedHomeResult>;
+  /**
+   * Optional per-adapter fail-fast liveness probe for the session write path.
+   * Runs once per execution right after the ACP session is established (fresh
+   * or warm-resume) and before any session config/prompt/turn work; a throw
+   * fails the run fast with `acpx_write_path_probe_failed` (never throws out of
+   * the executor). Absent → no probe runs and behavior is byte-identical to
+   * today. The codex adapter supplies the implementation; see
+   * {@link AcpxSessionWritePathProbeInput}.
+   */
+  probeSessionWritePath?: (input: AcpxSessionWritePathProbeInput) => Promise<void>;
 }
 
 interface AcpxPreparedRuntime {
@@ -2555,7 +2580,7 @@ export function summarizeAcpxTurnUsage(input: {
   return { usage, usageDetail, costUsd, cumulativeCostUsd };
 }
 
-type AcpxExecutionPhase = "ensure_session" | "configure_session" | "turn";
+type AcpxExecutionPhase = "ensure_session" | "configure_session" | "write_path_probe" | "turn";
 
 function describeErrorDiagnostics(err: unknown): {
   errorName: string;
@@ -2619,6 +2644,7 @@ function classifyError(
     if (acpCode === "ACP_TURN_FAILED") return "acpx_turn_failed";
     if (acpCode === "ACP_BACKEND_MISSING") return "acpx_backend_missing";
     if (acpCode === "ACP_BACKEND_UNAVAILABLE") return "acpx_backend_unavailable";
+    if (phase === "write_path_probe") return "acpx_write_path_probe_failed";
     if (phase === "ensure_session") return "acpx_session_init_failed";
     if (phase === "configure_session") return "acpx_session_config_failed";
     if (phase === "turn") return "acpx_turn_failed";
@@ -3471,6 +3497,53 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       // further. The agent turn runs after and is out of the startup root's scope.
       rootSpan.end(false);
       const sessionHandle = handle;
+      if (deps.probeSessionWritePath) {
+        try {
+          await measureStartupStep(ctx, now, "acp.write_path_probe", async () => {
+            await deps.probeSessionWritePath!({
+              ctx,
+              cwd: prepared.cwd,
+              env: prepared.env,
+              executionTarget: readAdapterExecutionTarget({
+                executionTarget: ctx.executionTarget,
+                legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+              }),
+            });
+          }, prepared.stepMetrics);
+        } catch (err) {
+          const { classified, message } = await emitAcpxFailure({
+            ctx,
+            prepared,
+            err,
+            phase: "write_path_probe",
+          });
+          await runtime.close({
+            handle: sessionHandle,
+            reason: "paperclip write-path probe cleanup",
+            discardPersistentState: false,
+          }).catch(() => {});
+          const existing = warmHandles.get(prepared.sessionKey);
+          if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
+            clearWarmHandleTimer(existing);
+            warmHandles.delete(prepared.sessionKey);
+          }
+          await discardStagedRuntime({ handles: stagedRuntimes, prepared });
+          await cleanupRemoteBridges(prepared);
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage: message,
+            ...classified,
+            ...billingFields,
+            ...referencedProjectStagingFailuresField,
+            model: prepared.requestedModel || null,
+            clearSession,
+            resultJson: { phase: "write_path_probe" },
+            summary: message,
+          };
+        }
+      }
       try {
         await applySessionConfigOptions({
           runtime,

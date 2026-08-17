@@ -33,6 +33,7 @@ import {
   rewriteGeminiAcpFlagForVersion,
   summarizeAcpxTurnUsage,
   type AcpxEngineExecutorOptions,
+  type AcpxSessionWritePathProbeInput,
 } from "./execute.js";
 import { runChildProcess } from "../server-utils.js";
 import {
@@ -4375,5 +4376,132 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(emitted.has("stage.sync")).toBe(false);
     expect(emitted.has("bridge.paperclip")).toBe(false);
     expect(emitted.has("bridge.process-session")).toBe(false);
+  });
+});
+
+describe("ACPX engine session write-path probe", () => {
+  it("fails the run fast when probeSessionWritePath throws, before any config or turn work", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    await fs.mkdir(localCwd, { recursive: true });
+    let ensureSessionCalls = 0;
+    let startTurnCalls = 0;
+    const events: Array<{ eventType: string; payload?: Record<string, unknown> }> = [];
+    const execute = createAcpxEngineExecutor({
+      probeSessionWritePath: async () => {
+        throw new Error("sentinel write broke");
+      },
+      createRuntime: () =>
+        ({
+          ensureSession: async () => {
+            ensureSessionCalls += 1;
+            return {
+              backendSessionId: "backend-session",
+              agentSessionId: "agent-session",
+              runtimeSessionName: "runtime-session",
+            };
+          },
+          startTurn: () => {
+            startTurnCalls += 1;
+            return {
+              events: (async function* () {})(),
+              result: Promise.resolve({ status: "completed" as const, stopReason: "end_turn" }),
+              cancel: async () => {},
+            };
+          },
+          close: async () => {},
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-write-path-probe-fail",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onEvent: async (event: { eventType: string; payload?: Record<string, unknown> }) => {
+        events.push(event);
+      },
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("acpx_write_path_probe_failed");
+    expect(result.errorMessage).toContain("sentinel write broke");
+    expect((result.resultJson as Record<string, unknown> | null)?.phase).toBe("write_path_probe");
+    // The session was established exactly once, then the run failed before any
+    // config or turn work.
+    expect(ensureSessionCalls).toBe(1);
+    expect(startTurnCalls).toBe(0);
+    // The probe is a measured startup step; a throwing probe still reports its
+    // duration with outcome = failed before the error propagates.
+    const probeEvents = events.filter(
+      (event) =>
+        event.eventType === "run.startup.step" && event.payload?.step === "acp.write_path_probe",
+    );
+    expect(probeEvents).toHaveLength(1);
+    expect(probeEvents[0]!.payload?.outcome).toBe("failed");
+  });
+
+  it("runs probeSessionWritePath once with the prepared session cwd/env and still completes the turn", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    await fs.mkdir(localCwd, { recursive: true });
+    const probeInputs: AcpxSessionWritePathProbeInput[] = [];
+    let startTurnCalls = 0;
+    const execute = createAcpxEngineExecutor({
+      probeSessionWritePath: async (input) => {
+        probeInputs.push(input);
+      },
+      createRuntime: () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => {
+            startTurnCalls += 1;
+            return {
+              events: (async function* () {
+                yield { type: "done", stopReason: "end_turn" };
+              })(),
+              result: Promise.resolve({ status: "completed" as const, stopReason: "end_turn" }),
+              cancel: async () => {},
+            };
+          },
+          setConfigOption: async () => {},
+          close: async () => {},
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-write-path-probe-pass",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: {
+        agent: "custom",
+        agentCommand: "node ./fake-acp.js",
+        stateDir,
+        cwd: localCwd,
+        env: { WRITE_PATH_PROBE_MARKER: "probe-env-value" },
+      },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(startTurnCalls).toBe(1);
+    expect(probeInputs).toHaveLength(1);
+    const probeInput = probeInputs[0]!;
+    expect(probeInput.ctx.runId).toBe("run-write-path-probe-pass");
+    expect(probeInput.cwd).toBe(localCwd);
+    expect(probeInput.env.WRITE_PATH_PROBE_MARKER).toBe("probe-env-value");
+    // A local run has no execution target, so the probe writes via the host fs.
+    expect(probeInput.executionTarget).toBeNull();
   });
 });

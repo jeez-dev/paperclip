@@ -253,6 +253,10 @@ function buildContext(root: string, overrides: Partial<AdapterExecutionContext> 
       stateDir: path.join(root, "state"),
       env: {
         CODEX_HOME: path.join(root, "codex-home"),
+        // JEE-442: the real write-path probe runs in executor tests; the fleet
+        // bypass mode (agent-full-access) skips the bwrap namespace canary,
+        // which hard-fails on hosts whose kernel blocks user namespaces.
+        INITIAL_AGENT_MODE: "agent-full-access",
       },
       promptTemplate: "Do the assigned work.",
     },
@@ -742,6 +746,10 @@ describe("codex_local ACP lane", () => {
         stateDir: path.join(root, "state"),
         env: {
           CODEX_HOME: path.join(root, "codex-home"),
+          // JEE-442: the real probe executes in this test; keep the session in
+          // the fleet bypass mode so the bwrap canary (broken on userns-blocked
+          // hosts) is skipped.
+          INITIAL_AGENT_MODE: "agent-full-access",
         },
         model: "gpt-5.5",
         modelReasoningEffort: "high",
