@@ -31,6 +31,7 @@ import type {
   AcpxRemoteManagedHomeResult,
 } from "@paperclipai/adapter-utils/acpx-engine/execute";
 import {
+  asBoolean,
   asNumber,
   asString,
   parseObject,
@@ -154,6 +155,22 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
     typeof config.model === "string" ? config.model : "",
   );
 
+  // JEE-413: the ACP lane cannot take the CLI lane's --dangerously-bypass
+  // flag, so map the bypass config onto codex-acp's INITIAL_AGENT_MODE env
+  // instead. "agent-full-access" resolves to a dangerFullAccess sandbox
+  // policy + approvalPolicy "never" inside codex-acp, keeping apply_patch
+  // out of bwrap on hosts that block user namespaces. An explicit operator
+  // INITIAL_AGENT_MODE always wins; non-bypass runs keep env byte-identical.
+  const envConfig = parseObject(config.env);
+  const acpSandboxBypassRequested =
+    asBoolean(config.dangerouslyBypassApprovalsAndSandbox, false) ||
+    asBoolean(config.dangerouslyBypassSandbox, false);
+  const acpEnvOverride =
+    acpSandboxBypassRequested &&
+    !Object.prototype.hasOwnProperty.call(envConfig, "INITIAL_AGENT_MODE")
+      ? { env: { ...envConfig, INITIAL_AGENT_MODE: "agent-full-access" } }
+      : {};
+
   return {
     ...config,
     agent: "codex",
@@ -164,6 +181,7 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
     ...(normalizedModel ? { model: normalizedModel } : {}),
     ...(agentCommand ? { agentCommand } : {}),
     ...(stateDir ? { stateDir } : {}),
+    ...acpEnvOverride,
   };
 }
 
