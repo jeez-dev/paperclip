@@ -478,6 +478,52 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("injects INITIAL_AGENT_MODE=agent-full-access when sandbox bypass is configured", () => {
+    const result = buildCodexAcpConfig({
+      engine: "acp",
+      dangerouslyBypassApprovalsAndSandbox: true,
+    });
+    expect(result.env).toMatchObject({ INITIAL_AGENT_MODE: "agent-full-access" });
+  });
+
+  it("injects INITIAL_AGENT_MODE for the legacy dangerouslyBypassSandbox alias", () => {
+    const result = buildCodexAcpConfig({
+      engine: "acp",
+      dangerouslyBypassSandbox: true,
+    });
+    expect(result.env).toMatchObject({ INITIAL_AGENT_MODE: "agent-full-access" });
+  });
+
+  it("keeps an explicit operator INITIAL_AGENT_MODE over the bypass default", () => {
+    const result = buildCodexAcpConfig({
+      engine: "acp",
+      dangerouslyBypassApprovalsAndSandbox: true,
+      env: { INITIAL_AGENT_MODE: "read-only" },
+    });
+    expect(result.env).toEqual({ INITIAL_AGENT_MODE: "read-only" });
+  });
+
+  it("leaves env byte-identical when bypass is not requested", () => {
+    const env = { OPENAI_API_KEY: "sk-test" };
+    const withoutEnv = buildCodexAcpConfig({ engine: "acp" });
+    expect(withoutEnv.env).toBeUndefined();
+    const withEnv = buildCodexAcpConfig({ engine: "acp", env });
+    expect(withEnv.env).toBe(env);
+  });
+
+  it("passes secret-binding-shaped env values through untouched alongside the injection", () => {
+    const binding = { type: "secret_ref", secretKey: "openai-key" };
+    const result = buildCodexAcpConfig({
+      engine: "acp",
+      dangerouslyBypassApprovalsAndSandbox: true,
+      env: { OPENAI_API_KEY: binding },
+    });
+    expect(result.env).toMatchObject({
+      OPENAI_API_KEY: binding,
+      INITIAL_AGENT_MODE: "agent-full-access",
+    });
+  });
+
   it("checks the Node version required by the ACPX runtime", () => {
     setNodeVersion("v22.12.0");
     expect(nodeVersionMeetsCodexAcpMinimum()).toBe(false);
