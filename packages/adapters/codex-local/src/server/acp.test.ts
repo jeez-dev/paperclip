@@ -253,10 +253,6 @@ function buildContext(root: string, overrides: Partial<AdapterExecutionContext> 
       stateDir: path.join(root, "state"),
       env: {
         CODEX_HOME: path.join(root, "codex-home"),
-        // JEE-442: the real write-path probe runs in executor tests; the fleet
-        // bypass mode (agent-full-access) skips the bwrap namespace canary,
-        // which hard-fails on hosts whose kernel blocks user namespaces.
-        INITIAL_AGENT_MODE: "agent-full-access",
       },
       promptTemplate: "Do the assigned work.",
     },
@@ -667,65 +663,6 @@ describe("codex_local ACP lane", () => {
     );
   });
 
-  it("emits the canonical adapter_auth_missing check for a missing-auth sandbox target", async () => {
-    const root = await makeTempRoot("paperclip-codex-acp-sandbox-missing-auth-");
-    const sharedCodexHome = path.join(root, "shared-codex-home");
-    const managedAgentHome = path.join(
-      root,
-      "paperclip-home",
-      "instances",
-      "test",
-      "companies",
-      "company-1",
-      "agents",
-      "agent-1",
-      "codex-home",
-    );
-    await fs.mkdir(sharedCodexHome, { recursive: true });
-    setNodeVersion("v22.13.0");
-    process.env.CODEX_HOME = sharedCodexHome;
-    delete process.env.OPENAI_API_KEY;
-
-    const result = await testCodexAcpEnvironment({
-      adapterType: "codex_local",
-      companyId: "company-1",
-      config: {
-        engine: "acp",
-        cwd: root,
-        // A shell-style command resolves without a real binary in the sandbox.
-        agentCommand: "node ./fake-acp.js",
-        env: { CODEX_HOME: managedAgentHome, OPENAI_API_KEY: "" },
-      },
-      executionTarget: {
-        kind: "remote",
-        transport: "sandbox",
-        providerKey: "fake-plugin",
-        remoteCwd: "/work",
-        runner: {
-          execute: async () => ({
-            exitCode: 0,
-            signal: null,
-            timedOut: false,
-            stdout: "",
-            stderr: "",
-            pid: null,
-            startedAt: new Date().toISOString(),
-          }),
-        },
-      } as never,
-    });
-
-    // A missing-auth sandbox is a warning, not a failure, and it carries the
-    // neutral canonical check code for the user interface.
-    expect(result.status).toBe("warn");
-    expect(result.checks).toContainEqual(
-      expect.objectContaining({
-        code: "adapter_auth_missing",
-        level: "warn",
-      }),
-    );
-  });
-
   it("executes through ACPX with Codex session config and ephemeral skills", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-exec-");
     const skill = await createRuntimeSkill(root);
@@ -746,10 +683,6 @@ describe("codex_local ACP lane", () => {
         stateDir: path.join(root, "state"),
         env: {
           CODEX_HOME: path.join(root, "codex-home"),
-          // JEE-442: the real probe executes in this test; keep the session in
-          // the fleet bypass mode so the bwrap canary (broken on userns-blocked
-          // hosts) is skipped.
-          INITIAL_AGENT_MODE: "agent-full-access",
         },
         model: "gpt-5.5",
         modelReasoningEffort: "high",

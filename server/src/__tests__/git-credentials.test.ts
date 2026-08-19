@@ -1,17 +1,21 @@
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
+  DEFAULT_GITHUB_APP_SECRET_NAMES,
   DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
   GIT_CREDENTIAL_TOKEN_ENV_KEY,
   buildGitAuthInvocation,
   createGitRemoteAuthProvider,
   describeGitAuthFailure,
   isGitHubHttpsRemoteUrl,
+  mintGitHubAppInstallationToken,
   scrubGitCredentialText,
+  signGitHubAppJwt,
 } from "../services/git-credentials.ts";
 
 const fakeDb = null as unknown as Db;
@@ -138,6 +142,120 @@ describe("createGitRemoteAuthProvider", () => {
     });
     const invocation = await provider(githubUrl);
     expect(invocation?.secretName).toBe("GH_TOKEN");
+  });
+});
+
+describe("signGitHubAppJwt", () => {
+  it("produces an RS256 JWT with iss=appId and a sub-10-minute expiry, back-dated for clock drift", () => {
+    const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    const now = 1_700_000_000;
+    const jwt = signGitHubAppJwt("12345", pem, now);
+    const [headerPart, payloadPart] = jwt.split(".");
+    const header = JSON.parse(Buffer.from(headerPart, "base64url").toString());
+    const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString());
+    expect(header).toEqual({ alg: "RS256", typ: "JWT" });
+    expect(payload.iss).toBe("12345");
+    expect(payload.iat).toBe(now - 60);
+    expect(payload.exp).toBeLessThan(now + 600);
+    expect(payload.exp).toBeGreaterThan(now);
+  });
+});
+
+describe("mintGitHubAppInstallationToken", () => {
+  it("posts a Bearer JWT to the installation access-tokens endpoint and returns the token", async () => {
+    const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      expect(url).toBe("https://api.github.com/app/installations/inst-1/access_tokens");
+      expect(init.method).toBe("POST");
+      expect((init.headers as Record<string, string>).Authorization).toMatch(/^Bearer ey/);
+      return new Response(JSON.stringify({ token: "ghs_minted" }), { status: 201 });
+    });
+    const token = await mintGitHubAppInstallationToken("app-1", "inst-1", pem, fetchImpl as unknown as typeof fetch);
+    expect(token).toBe("ghs_minted");
+  });
+
+  it("throws when GitHub rejects the exchange", async () => {
+    const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    const pem = privateKey.export({ type: "pkcs1", format: "pem" }).toString();
+    const fetchImpl = vi.fn(async () => new Response("nope", { status: 401 }));
+    await expect(
+      mintGitHubAppInstallationToken("app-1", "inst-1", pem, fetchImpl as unknown as typeof fetch),
+    ).rejects.toThrow();
+  });
+});
+
+describe("createGitRemoteAuthProvider — GitHub App fallback", () => {
+  const githubUrl = "https://github.com/example/repo.git";
+
+  it("mints an installation token when the App trio is configured and no PAT secret exists", async () => {
+    const secrets = buildSecretsFake({
+      GITHUB_APP_ID: "app-1",
+      GITHUB_APP_INSTALLATION_ID: "inst-1",
+      GITHUB_APP_PEM: "pem-contents",
+    });
+    const mintAppToken = vi.fn(async () => "ghs_minted");
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+      mintAppToken,
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("ghs_minted");
+    expect(invocation?.source).toBe("company_secret");
+    expect(invocation?.secretName).toBe(DEFAULT_GITHUB_APP_SECRET_NAMES.privateKey);
+    expect(mintAppToken).toHaveBeenCalledWith("app-1", "inst-1", "pem-contents", expect.anything());
+  });
+
+  it("does not mint a token when only part of the App trio is configured", async () => {
+    const secrets = buildSecretsFake({ GITHUB_APP_ID: "app-1", GITHUB_APP_INSTALLATION_ID: "inst-1" });
+    const mintAppToken = vi.fn(async () => "ghs_minted");
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: { GITHUB_TOKEN: "env-fallback" },
+      mintAppToken,
+    });
+    const invocation = await provider(githubUrl);
+    expect(mintAppToken).not.toHaveBeenCalled();
+    expect(invocation?.source).toBe("server_env");
+  });
+
+  it("falls through to server env when the App token exchange fails", async () => {
+    const secrets = buildSecretsFake({
+      GITHUB_APP_ID: "app-1",
+      GITHUB_APP_INSTALLATION_ID: "inst-1",
+      GITHUB_APP_PEM: "pem-contents",
+    });
+    const mintAppToken = vi.fn(async () => {
+      throw new Error("GitHub rejected the exchange");
+    });
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: { GITHUB_TOKEN: "env-fallback" },
+      mintAppToken,
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("env-fallback");
+    expect(invocation?.source).toBe("server_env");
+  });
+
+  it("prefers a PAT-style company secret over a configured App trio", async () => {
+    const secrets = buildSecretsFake({
+      GITHUB_TOKEN: "pat-token",
+      GITHUB_APP_ID: "app-1",
+      GITHUB_APP_INSTALLATION_ID: "inst-1",
+      GITHUB_APP_PEM: "pem-contents",
+    });
+    const mintAppToken = vi.fn(async () => "ghs_minted");
+    const provider = createGitRemoteAuthProvider(fakeDb, "company-1", undefined, {
+      secrets,
+      env: {},
+      mintAppToken,
+    });
+    const invocation = await provider(githubUrl);
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("pat-token");
+    expect(mintAppToken).not.toHaveBeenCalled();
   });
 });
 

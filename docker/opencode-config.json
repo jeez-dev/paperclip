@@ -1,0 +1,53 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "aleria/kimi-k3",
+  "provider": {
+    "aleria": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Aleria",
+      "options": {
+        "baseURL": "https://inference.aleria.com/v1",
+        "includeUsage": true
+      },
+      "env": ["ALERIA_API_KEY"],
+      "models": {
+        "aleria": {
+          "id": "aleria",
+          "name": "Aleria",
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 202752,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0.9,
+            "output": 3.1,
+            "cache_read": 0.17
+          }
+        },
+        "kimi-k3": {
+          "id": "moonshotai/kimi-k3",
+          "name": "Kimi K3",
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "limit": {
+            "context": 1000000,
+            "output": 16384
+          },
+          "cost": {
+            "input": 0.716,
+            "output": 15,
+            "cache_read": 0.3
+          }
+        }
+      }
+    }
+  }
+}
