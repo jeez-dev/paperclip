@@ -31,6 +31,7 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "issue_write_assignee_run_lock",
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
+  "cross_issue_influence_run_unbound",
   "issue_write_attribution_spoof_rejected",
 ] as const;
 
@@ -260,6 +261,32 @@ export function describeIssueWriteDenial(
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
           `and retry.`,
 
+      };
+
+    case "cross_issue_influence_run_unbound":
+      // Distinct from `..._run_context_required` on purpose. There the run id
+      // itself is missing or unresolvable, so resending the header is the fix.
+      // Here the run resolves fine and the header changes nothing — the run was
+      // started without a task bound (a timer wake), so there is no source task
+      // to count cross-issue writes against. Prescribing the header here sent
+      // agents into retry loops until they gave up and parked finished work.
+      return {
+        code,
+        status: 403,
+        tone: "lock",
+        boundary: "Heartbeat run context",
+        title: "This run is not bound to a task",
+        description:
+          `This run resolved correctly, but it was started without a task bound to it ` +
+          `(a timer wake rather than a task assignment), so a write to ${issue} has no source ` +
+          `task to attribute it to and the cross-issue cap cannot be counted. ` +
+          `The run id is already correct — resending it will not clear this.`,
+        whoCanAct: `${actor}, once this run is bound to a task.`,
+        sanctionedPath:
+          `Check out the task you are writing to first (\`POST /api/issues/{id}/checkout\`), ` +
+          `which binds this run to it and makes that task the source for the rest of the run. ` +
+          `Inspect the binding at \`GET /api/heartbeat-runs/{runId}\` — its \`contextSnapshot.issueId\` ` +
+          `is the source task. If checkout is not appropriate, ${CHILD_ISSUE_PATH}.`,
       };
 
     case "issue_write_attribution_spoof_rejected":

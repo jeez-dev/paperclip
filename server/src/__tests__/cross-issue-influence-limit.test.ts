@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
   CROSS_ISSUE_INFLUENCE_LIMIT,
+  bindRunSourceIssue,
   crossIssueInfluenceLimitError,
   evaluateCrossIssueInfluenceLimit,
   observeCrossIssueInfluence,
@@ -175,7 +176,10 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  // A timer-woken run resolves fine but carries no source task. It must NOT
+  // reuse the run-context code, whose remediation is "resend the run id" — the
+  // run id is already correct, and that advice cost two heartbeats on JEE-689.
+  it("reports an unbound run distinctly from a missing one", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -186,8 +190,81 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      details: { code: "cross_issue_influence_run_unbound" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+});
+
+describe("bindRunSourceIssue", () => {
+  function bindDb(contextSnapshot: unknown, runFound = true) {
+    const updates: Array<Record<string, unknown>> = [];
+    const tx = {
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            for: () => ({
+              then: (resolve: (rows: unknown[]) => unknown) =>
+                resolve(runFound ? [{ contextSnapshot }] : []),
+            }),
+          }),
+        }),
+      }),
+      update: () => ({
+        set: (value: Record<string, unknown>) => ({
+          where: async () => {
+            updates.push(value);
+          },
+        }),
+      }),
+    };
+    return {
+      db: { transaction: async (cb: (value: typeof tx) => Promise<unknown>) => cb(tx) },
+      updates,
+    };
+  }
+
+  const input = {
+    companyId: "22222222-2222-4222-8222-222222222222",
+    runId: "11111111-1111-4111-8111-111111111111",
+    agentId: "33333333-3333-4333-8333-333333333333",
+    issueId: "55555555-5555-4555-8555-555555555555",
+  };
+
+  it("binds an unbound run to the checked-out issue", async () => {
+    const fake = bindDb({ wakeReason: "heartbeat_timer" });
+
+    await expect(bindRunSourceIssue(fake.db as never, input)).resolves.toBe(true);
+    expect(fake.updates).toEqual([
+      {
+        contextSnapshot: {
+          wakeReason: "heartbeat_timer",
+          issueId: "55555555-5555-4555-8555-555555555555",
+          boundBy: "issue.checkout",
+        },
+      },
+    ]);
+  });
+
+  it("never repoints a run that already has a source issue", async () => {
+    const fake = bindDb({ issueId: "44444444-4444-4444-8444-444444444444" });
+
+    await expect(bindRunSourceIssue(fake.db as never, input)).resolves.toBe(false);
+    expect(fake.updates).toEqual([]);
+  });
+
+  it("is a no-op for a malformed run id", async () => {
+    const fake = bindDb({});
+
+    await expect(bindRunSourceIssue(fake.db as never, { ...input, runId: "not-a-uuid" }))
+      .resolves.toBe(false);
+    expect(fake.updates).toEqual([]);
+  });
+
+  it("is a no-op when the run row does not exist", async () => {
+    const fake = bindDb({}, false);
+
+    await expect(bindRunSourceIssue(fake.db as never, input)).resolves.toBe(false);
+    expect(fake.updates).toEqual([]);
   });
 });

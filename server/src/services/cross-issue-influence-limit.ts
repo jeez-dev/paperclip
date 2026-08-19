@@ -28,6 +28,69 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
+/**
+ * The run resolved but carries no source task, so the header the other error
+ * prescribes cannot help. Kept separate from `crossIssueInfluenceRunContextError`
+ * so the agent is told to bind the run (checkout) instead of retrying the header.
+ */
+export function crossIssueInfluenceRunUnboundError() {
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_unbound");
+  return forbidden(body.error, body.details);
+}
+
+/**
+ * Binds a heartbeat run to the task it just checked out.
+ *
+ * Timer-woken runs are minted with no task in their context snapshot, which
+ * leaves every write to an existing task with no source to attribute against.
+ * Checkout is the moment the run commits to a task, so it is where the binding
+ * belongs. An existing binding is never overwritten: the first task a run binds
+ * to stays its source, otherwise a run could hop its own origin and spend a
+ * fresh cross-issue budget on every checkout.
+ */
+export async function bindRunSourceIssue(
+  db: Db,
+  input: { companyId: string; runId: string; agentId: string; issueId: string },
+): Promise<boolean> {
+  if (!isUuidLike(input.runId)) return false;
+
+  return db.transaction(async (tx) => {
+    const run = await tx
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.id, input.runId),
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+      ))
+      .for("update")
+      .then((rows) => rows[0] ?? null);
+    if (!run) return false;
+    if (readRunSourceIssueId(run.contextSnapshot)) return false;
+
+    const snapshot =
+      run.contextSnapshot && typeof run.contextSnapshot === "object" && !Array.isArray(run.contextSnapshot)
+        ? (run.contextSnapshot as Record<string, unknown>)
+        : {};
+    await tx
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { ...snapshot, issueId: input.issueId, boundBy: "issue.checkout" } })
+      .where(eq(heartbeatRuns.id, input.runId));
+
+    logger.info(
+      {
+        event: "heartbeat_run_bound_to_issue",
+        companyId: input.companyId,
+        runId: input.runId,
+        agentId: input.agentId,
+        issueId: input.issueId,
+      },
+      "heartbeat run bound to checked-out issue",
+    );
+    return true;
+  });
+}
+
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
@@ -103,8 +166,12 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // The run exists and belongs to this agent, but carries no source task —
+    // a timer wake. Report that distinctly: the header the other error asks for
+    // is already correct here, and telling the agent to resend it is what
+    // stalled finished work behind a retry loop.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!sourceIssueId) throw crossIssueInfluenceRunUnboundError();
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())

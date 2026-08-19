@@ -230,6 +230,7 @@ import {
   isIssueReviewVerdictInteraction,
 } from "../services/issue-review-policy.js";
 import {
+  bindRunSourceIssue,
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
@@ -10409,6 +10410,27 @@ export function issueRoutes(
       throw error;
     }
     const actor = getActorInfo(req);
+
+    // Bind the run to what it just checked out. A timer-woken run starts with no
+    // task in its context snapshot, which otherwise leaves it unable to write its
+    // own disposition to any existing task. Best-effort: a failure here must not
+    // fail an otherwise good checkout.
+    if (req.actor.type === "agent" && checkoutRunId && req.body.agentId) {
+      try {
+        await bindRunSourceIssue(db, {
+          companyId: issue.companyId,
+          runId: checkoutRunId,
+          agentId: req.body.agentId,
+          issueId: issue.id,
+        });
+      } catch (error) {
+        logger.warn(
+          { event: "heartbeat_run_bind_failed", runId: checkoutRunId, issueId: issue.id, error },
+          "could not bind heartbeat run to checked-out issue",
+        );
+      }
+    }
+
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
     }
