@@ -89,7 +89,7 @@ jobs:
           path: |
             tests/storybook-visual/playwright-report/
             tests/storybook-visual/test-results/
-          retention-days: 30
+          retention-days: 1
           if-no-files-found: warn
 
       - name: Upload updated baseline review bundle
@@ -98,5 +98,5 @@ jobs:
         with:
           name: storybook-visual-baseline-review-${{ github.run_id }}
           path: tests/storybook-visual/baseline-review/snapshots.tgz
-          retention-days: 30
+          retention-days: 1
           if-no-files-found: error
